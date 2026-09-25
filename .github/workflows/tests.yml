@@ -1,0 +1,43 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.10', '3.14']
+        backend: [native, python]
+    env:
+      AYAZ_NO_NATIVE: ${{ matrix.backend == 'python' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build and install
+        run: |
+          python -m pip install build
+          python -m build
+          python -m pip install dist/*.whl
+      - name: Test installed package outside the checkout
+        run: |
+          test_dir=$(mktemp -d)
+          cp -R tests examples "$test_dir/"
+          cd "$test_dir"
+          python -c "from ayaz_decryptor import crypto; assert (crypto._native_salsa_crypt is not None) == ('${{ matrix.backend }}' == 'native')"
+          python -m unittest discover -s tests -t .
+          python examples/make_demo.py demo-output
+          ayaz-decryptor decrypt demo-output/encrypted.bin --profile demo-output/profile.json --original-name a.txt --output demo-output/recovered.txt
+          cmp demo-output/original.txt demo-output/recovered.txt
+          ayaz-decryptor analyze demo-output/pairs.zip
+          ayaz-decryptor verify demo-output/pairs.zip --profile demo-output/profile.json
+      - name: Test search runner and C++ reference
+        run: |
+          python -m unittest discover -s cuda -p 'test_*.py'
+          make -C cuda test
