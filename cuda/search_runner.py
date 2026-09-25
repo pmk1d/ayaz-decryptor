@@ -98,15 +98,27 @@ def _load(path: Path, config: dict, digest: str, total: int) -> int:
     return position
 
 
+def _signal_worker(process: subprocess.Popen, sig: int) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        try:
+            os.killpg(process.pid, sig)
+        except PermissionError:
+            # На macOS группа может исчезнуть между poll() и отправкой сигнала.
+            if process.poll() is None:
+                try:
+                    process.send_signal(sig)
+                except PermissionError:
+                    if process.poll() is None:
+                        raise
+
+
 def _stop(process: subprocess.Popen) -> None:
     if process.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
+        _signal_worker(process, signal.SIGTERM)
         try:
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+            _signal_worker(process, signal.SIGKILL)
             process.wait(timeout=3)
 
 
@@ -164,10 +176,12 @@ def _worker_events(command: list[str], timeout: float) -> Iterator[tuple[str, ob
             raise SearchError("Исполнитель не завершился после закрытия вывода") from error
         yield "exit", {"returncode": code, "stderr": stderr.decode(errors="replace")}
     finally:
-        _stop(process)
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
+        try:
+            _stop(process)
+        finally:
+            selector.close()
+            process.stdout.close()
+            process.stderr.close()
 
 
 def run_search(

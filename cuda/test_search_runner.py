@@ -2,6 +2,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -238,9 +240,13 @@ class SearchRunnerTests(unittest.TestCase):
         elapsed = [0.0]
         with mock.patch.object(runner.time, "monotonic", side_effect=lambda: real_clock() + elapsed[0]):
             events = runner._worker_events(command, 30)
-            self.assertEqual(next(events)[0], "record")
-            elapsed[0] = 100.0
-            remaining = list(events)
+            try:
+                first_record = next(event for event in events if event[0] != "tick")
+                self.assertEqual(first_record[0], "record")
+                elapsed[0] = 100.0
+                remaining = list(events)
+            finally:
+                events.close()
         self.assertEqual(remaining[-1], ("exit", {"returncode":0,"stderr":""}))
 
     def test_concurrent_use_is_rejected(self):
@@ -277,6 +283,86 @@ class SearchRunnerTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 list(self.search(**kwargs))
         self.assertFalse(self.log.exists())
+
+
+class WorkerStopTests(unittest.TestCase):
+    def process(self, polls):
+        process = mock.Mock(spec=subprocess.Popen)
+        process.pid = 12345
+        process.poll.side_effect = polls
+        return process
+
+    def test_group_permission_error_after_exit_is_reaped(self):
+        process = self.process([None, 0])
+        with mock.patch.object(runner.os, "killpg", side_effect=PermissionError):
+            runner._stop(process)
+        process.send_signal.assert_not_called()
+        process.wait.assert_called_once_with(timeout=3)
+
+    def test_group_permission_error_falls_back_to_owned_process(self):
+        process = self.process([None, None])
+        with mock.patch.object(runner.os, "killpg", side_effect=PermissionError):
+            runner._stop(process)
+        process.send_signal.assert_called_once_with(signal.SIGTERM)
+        process.wait.assert_called_once_with(timeout=3)
+
+    def test_kill_fallback_after_term_timeout(self):
+        process = self.process([None, None])
+        process.wait.side_effect = [subprocess.TimeoutExpired("worker", 3), 0]
+        with mock.patch.object(runner.os, "killpg", side_effect=[None, PermissionError]) as killpg:
+            runner._stop(process)
+        self.assertEqual(killpg.call_args_list, [
+            mock.call(process.pid, signal.SIGTERM), mock.call(process.pid, signal.SIGKILL),
+        ])
+        process.send_signal.assert_called_once_with(signal.SIGKILL)
+        self.assertEqual(process.wait.call_args_list, [mock.call(timeout=3), mock.call(timeout=3)])
+
+    def test_live_process_permission_error_is_not_hidden(self):
+        process = self.process([None, None, None])
+        process.send_signal.side_effect = PermissionError
+        with mock.patch.object(runner.os, "killpg", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                runner._stop(process)
+        process.wait.assert_not_called()
+
+    def test_fallback_permission_error_after_exit_is_reaped(self):
+        process = self.process([None, None, 0])
+        process.send_signal.side_effect = PermissionError
+        with mock.patch.object(runner.os, "killpg", side_effect=PermissionError):
+            runner._stop(process)
+        process.wait.assert_called_once_with(timeout=3)
+
+    def test_disappeared_group_still_reaps_child(self):
+        process = self.process([None])
+        with mock.patch.object(runner.os, "killpg", side_effect=ProcessLookupError):
+            runner._stop(process)
+        process.wait.assert_called_once_with(timeout=3)
+
+    def test_kill_timeout_is_not_hidden(self):
+        process = self.process([None])
+        process.wait.side_effect = subprocess.TimeoutExpired("worker", 3)
+        with mock.patch.object(runner.os, "killpg"):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                runner._stop(process)
+        self.assertEqual(process.wait.call_count, 2)
+
+    def test_stop_failure_still_closes_selector_and_pipes(self):
+        for error in (PermissionError(), subprocess.TimeoutExpired("worker", 3)):
+            with self.subTest(error=type(error).__name__):
+                process = mock.Mock()
+                selector = mock.Mock()
+                selector.select.return_value = []
+                with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
+                     mock.patch.object(runner.selectors, "DefaultSelector", return_value=selector), \
+                     mock.patch.object(runner.os, "set_blocking"), \
+                     mock.patch.object(runner, "_stop", side_effect=error):
+                    events = runner._worker_events(["synthetic-worker"], 30)
+                    self.assertEqual(next(events), ("tick", None))
+                    with self.assertRaises(type(error)):
+                        events.close()
+                selector.close.assert_called_once_with()
+                process.stdout.close.assert_called_once_with()
+                process.stderr.close.assert_called_once_with()
 
 
 if __name__ == "__main__":
